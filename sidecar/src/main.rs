@@ -1,6 +1,6 @@
 mod memory;
 
-use memory::{Embedder, FastEmbedder, HashEmbedder, MemoryStore};
+use memory::{Embedder, FastEmbedder, HashEmbedder, IngestTurn, MemoryStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
@@ -28,12 +28,8 @@ struct Response {
 }
 
 #[derive(Deserialize)]
-struct IngestParams {
-    identity: String,
-    session_id: String,
-    speaker: String,
-    text: String,
-    ts: i64,
+struct BatchIngestParams {
+    turns: Vec<IngestTurn>,
 }
 
 #[derive(Deserialize)]
@@ -55,17 +51,21 @@ fn default_top_k() -> usize {
 
 fn handle(memory: &mut MemoryStore, request: Request) -> (Response, bool) {
     let result: Result<Value> = match request.command.as_str() {
-        "ingest" => serde_json::from_value::<IngestParams>(request.params)
+        "ingest" => serde_json::from_value::<IngestTurn>(request.params)
             .map_err(Into::into)
             .and_then(|params| {
-                let (ingested, turn_id) = memory.ingest(
-                    &params.identity,
-                    &params.session_id,
-                    &params.speaker,
-                    &params.text,
-                    params.ts,
-                )?;
+                let (ingested, turn_id) = memory.ingest(&params)?;
                 Ok(json!({ "ingested": ingested, "turn_id": turn_id }))
+            }),
+        "ingest_batch" => serde_json::from_value::<BatchIngestParams>(request.params)
+            .map_err(Into::into)
+            .and_then(|params| {
+                let results = memory.ingest_batch(&params.turns)?;
+                let ingested = results.iter().filter(|(ingested, _)| *ingested).count();
+                Ok(json!({
+                    "ingested": ingested,
+                    "skipped": results.len() - ingested,
+                }))
             }),
         "query" => serde_json::from_value::<QueryParams>(request.params)
             .map_err(Into::into)

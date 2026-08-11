@@ -59,6 +59,12 @@ rebuilding indexes for every query.
 When a root session becomes idle (`session.idle`), the plugin fetches its
 messages and sends only finalized canonical text to the sidecar.
 
+Ingestion is sent in batches of up to 64 turns. The sidecar generates their
+embeddings in one model call, writes them in one SQLite transaction, and
+rebuilds the graph and temporal views once per batch. This avoids the large CPU
+spike caused by embedding and rebuilding the indexes separately for every
+historical message during backfill.
+
 The following data is stored:
 
 - user messages;
@@ -210,6 +216,14 @@ the project.
 Production uses `bge-small-en-v1.5` through `fastembed`. The model runs locally,
 and no content is sent to external APIs.
 
+The current build uses the CPU execution provider. GPU execution is not
+required and is not enabled by default because it would require distributing
+and loading a compatible ONNX Runtime CUDA stack in addition to the NVIDIA
+driver. The batched CPU path is the portable default. For a temporary low-CPU
+test, the hash embedder can be selected with `OPENCODE_ZEROMEM_EMBEDDER=hash`,
+but its retrieval quality is intentionally not suitable as the production
+default.
+
 If the model cannot be initialized, the sidecar fails. There is no silent hash
 embedding fallback in production. The hash embedder is available only for
 tests through:
@@ -226,6 +240,8 @@ Each request contains `id`, `command`, and `params`. Each response repeats the
 Available commands:
 
 - `ingest`: stores a turn with identity-based deduplication;
+- `ingest_batch`: stores multiple turns with one embedding pass and one index
+  rebuild;
 - `query`: retrieves evidence and can exclude one session;
 - `stats`: reports turn, session, entity, and window counts;
 - `delete_session`: deletes all turns from one session;

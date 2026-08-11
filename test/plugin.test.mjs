@@ -101,13 +101,13 @@ test("idle ingests only canonical finalized text from root sessions", async () =
   const hooks = await ZeroMemPlugin(setup.input, setup.options)
 
   await hooks.event({ event: { type: "session.idle", properties: { sessionID: "root" } } })
-  await waitFor(() => calls.length === 2)
+  await waitFor(() => calls.length === 1)
 
-  assert.deepEqual(calls.map((call) => call.params.text), [
+  assert.deepEqual(calls[0].params.turns.map((turn) => turn.text), [
     "decisão do usuário",
     "resposta final",
   ])
-  assert.deepEqual(calls.map((call) => call.params.speaker), ["user", "assistant"])
+  assert.deepEqual(calls[0].params.turns.map((turn) => turn.speaker), ["user", "assistant"])
 })
 
 test("retrieval is injected once only for the pending user message", async () => {
@@ -214,6 +214,29 @@ test("backfill processes existing root sessions and skips children", async () =>
   await ZeroMemPlugin(setup.input, setup.options)
   await waitFor(() => calls.length === 1)
 
-  assert.equal(calls[0].command, "ingest")
-  assert.equal(calls[0].params.session_id, "root")
+  assert.equal(calls[0].command, "ingest_batch")
+  assert.equal(calls[0].params.turns[0].session_id, "root")
+})
+
+test("backfill keeps ingestion batches bounded", async () => {
+  const calls = []
+  const sidecar = {
+    request: async (command, params) => {
+      calls.push({ command, params })
+      return { ingested: params.turns?.length || 0 }
+    },
+  }
+  const sessions = [{ id: "root", time: { created: 1 } }]
+  const messages = new Map([[
+    "root",
+    Array.from({ length: 65 }, (_, index) => userMessage(`u${index}`, `memória ${index}`)),
+  ]])
+  const setup = fixture({ sidecar, sessions, messages })
+  setup.options.disableBackfill = false
+  setup.options.backfillDelay = 0
+
+  await ZeroMemPlugin(setup.input, setup.options)
+  await waitFor(() => calls.length === 2)
+
+  assert.deepEqual(calls.map((call) => call.params.turns.length), [64, 1])
 })

@@ -1,7 +1,7 @@
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use regex::Regex;
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
@@ -88,6 +88,15 @@ impl Embedder for HashEmbedder {
             })
             .collect())
     }
+}
+
+#[derive(Deserialize)]
+pub struct IngestTurn {
+    pub identity: String,
+    pub session_id: String,
+    pub speaker: String,
+    pub text: String,
+    pub ts: i64,
 }
 
 #[derive(Clone)]
@@ -189,45 +198,79 @@ impl MemoryStore {
         Ok(store)
     }
 
-    pub fn ingest(
-        &mut self,
-        identity: &str,
-        session_id: &str,
-        speaker: &str,
-        text: &str,
-        ts: i64,
-    ) -> Result<(bool, i64)> {
-        if text.trim().is_empty() {
-            return Err(Error::EmptyTurn);
-        }
-        let existing: Option<i64> = self
-            .connection
-            .query_row(
-                "SELECT id FROM turns WHERE identity = ?1",
-                [identity],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(id) = existing {
-            return Ok((false, id));
+    pub fn ingest(&mut self, turn: &IngestTurn) -> Result<(bool, i64)> {
+        let mut results = self.ingest_batch(std::slice::from_ref(turn))?;
+        Ok(results.remove(0))
+    }
+
+    pub fn ingest_batch(&mut self, turns: &[IngestTurn]) -> Result<Vec<(bool, i64)>> {
+        let mut results = vec![None; turns.len()];
+        let mut duplicate_of = vec![None; turns.len()];
+        let mut pending = HashMap::new();
+        let mut candidates = Vec::new();
+
+        for (index, turn) in turns.iter().enumerate() {
+            if turn.text.trim().is_empty() {
+                return Err(Error::EmptyTurn);
+            }
+            let existing: Option<i64> = self
+                .connection
+                .query_row(
+                    "SELECT id FROM turns WHERE identity = ?1",
+                    [&turn.identity],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(id) = existing {
+                results[index] = Some((false, id));
+            } else if let Some(candidate) = pending.get(&turn.identity) {
+                duplicate_of[index] = Some(*candidate);
+            } else {
+                pending.insert(turn.identity.clone(), index);
+                candidates.push((index, turn));
+            }
         }
 
-        let embedding = self.embedder.embed(&[text])?.remove(0);
-        self.connection.execute(
-            "INSERT INTO turns(identity, session_id, speaker, text, ts, embedding)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                identity,
-                session_id,
-                speaker,
-                text,
-                ts,
-                vector_to_bytes(&embedding)
-            ],
-        )?;
-        let id = self.connection.last_insert_rowid();
+        if candidates.is_empty() {
+            return Ok(results.into_iter().map(Option::unwrap).collect());
+        }
+
+        let texts: Vec<&str> = candidates
+            .iter()
+            .map(|(_, turn)| turn.text.as_str())
+            .collect();
+        let embeddings = self.embedder.embed(&texts)?;
+        if embeddings.len() != candidates.len() {
+            return Err(Error::Embedding(
+                "embedder returned an unexpected number of vectors".into(),
+            ));
+        }
+
+        let transaction = self.connection.transaction()?;
+        for ((index, turn), embedding) in candidates.iter().zip(embeddings) {
+            transaction.execute(
+                "INSERT INTO turns(identity, session_id, speaker, text, ts, embedding)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    turn.identity,
+                    turn.session_id,
+                    turn.speaker,
+                    turn.text,
+                    turn.ts,
+                    vector_to_bytes(&embedding)
+                ],
+            )?;
+            results[*index] = Some((true, transaction.last_insert_rowid()));
+        }
+        transaction.commit()?;
+
+        for (index, candidate) in duplicate_of.into_iter().enumerate() {
+            if let Some(candidate) = candidate {
+                results[index] = results[candidate].map(|(_, id)| (false, id));
+            }
+        }
         self.reload()?;
-        Ok((true, id))
+        Ok(results.into_iter().map(Option::unwrap).collect())
     }
 
     pub fn query(

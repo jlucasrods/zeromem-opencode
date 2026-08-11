@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url"
 const QUERY_TIMEOUT_MS = 1500
 const MAX_EVIDENCE_CHARS = 6000
 const TOP_K = 5
+const INGEST_BATCH_SIZE = 64
 
 class Sidecar {
   constructor(binary, dbPath, cachePath, onError, spawnProcess = spawn) {
@@ -231,6 +232,7 @@ export default async function ZeroMemPlugin(input, options = {}) {
       path: { id: sessionID },
       query: { directory },
     })) || []
+    const turns = []
     for (const entry of messages) {
       const message = canonicalMessage(entry)
       if (!message) {
@@ -239,13 +241,18 @@ export default async function ZeroMemPlugin(input, options = {}) {
       const identity = createHash("sha256")
         .update(`${projectID}\0${sessionID}\0${message.role}\0${message.timestamp}\0${message.text}`)
         .digest("hex")
-      await sidecar.request("ingest", {
+      turns.push({
         identity,
         session_id: sessionID,
         speaker: message.role,
         text: message.text,
         ts: message.timestamp,
-      }, 30000)
+      })
+    }
+    for (let index = 0; index < turns.length; index += INGEST_BATCH_SIZE) {
+      await sidecar.request("ingest_batch", {
+        turns: turns.slice(index, index + INGEST_BATCH_SIZE),
+      }, 120000)
     }
   }
 

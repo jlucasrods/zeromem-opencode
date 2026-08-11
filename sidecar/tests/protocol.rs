@@ -65,16 +65,25 @@ fn protocol_persists_deduplicates_excludes_and_deletes() {
     let mut sidecar = Sidecar::start(&directory);
 
     let first = sidecar.request(
-        "ingest",
+        "ingest_batch",
         json!({
-            "identity": "turn-a",
-            "session_id": "old-session",
-            "speaker": "user",
-            "text": "O banco principal do projeto Atlas usa PostgreSQL.",
-            "ts": 100
+            "turns": [{
+                "identity": "turn-a",
+                "session_id": "old-session",
+                "speaker": "user",
+                "text": "O banco principal do projeto Atlas usa PostgreSQL.",
+                "ts": 100
+            }, {
+                "identity": "turn-a",
+                "session_id": "old-session",
+                "speaker": "user",
+                "text": "O banco principal do projeto Atlas usa PostgreSQL.",
+                "ts": 100
+            }]
         }),
     );
-    assert_eq!(first["ingested"], true);
+    assert_eq!(first["ingested"], 1);
+    assert_eq!(first["skipped"], 1);
     let duplicate = sidecar.request(
         "ingest",
         json!({
