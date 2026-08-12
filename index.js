@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process"
-import { createHash } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { createInterface } from "node:readline"
 import { homedir } from "node:os"
 import { dirname, join, resolve } from "node:path"
@@ -8,7 +8,9 @@ import { fileURLToPath } from "node:url"
 const QUERY_TIMEOUT_MS = 1500
 const MAX_EVIDENCE_CHARS = 6000
 const TOP_K = 5
-const INGEST_BATCH_SIZE = 64
+const INGEST_BATCH_SIZE = 8
+const DEFAULT_BACKFILL_SESSIONS = 20
+const BACKFILL_LEASE_SECONDS = 30 * 60
 
 class Sidecar {
   constructor(binary, dbPath, cachePath, onError, spawnProcess = spawn) {
@@ -218,6 +220,18 @@ export default async function ZeroMemPlugin(input, options = {}) {
 
   const sidecar = options.sidecar || new Sidecar(binary, dbPath, cachePath, report, options.spawnProcess)
   const pendingQueries = new Map()
+  const backfillOwner = randomUUID()
+  const configuredBackfillSessions = Number.parseInt(
+    process.env.OPENCODE_ZEROMEM_BACKFILL_SESSIONS || "",
+    10,
+  )
+  const backfillSessions = Number.isInteger(options.backfillSessions)
+    && options.backfillSessions >= 0
+    ? options.backfillSessions
+    : Number.isInteger(configuredBackfillSessions)
+    && configuredBackfillSessions >= 0
+    ? configuredBackfillSessions
+    : DEFAULT_BACKFILL_SESSIONS
   let ingestionQueue = Promise.resolve()
 
   async function ingestSession(sessionID) {
@@ -264,15 +278,37 @@ export default async function ZeroMemPlugin(input, options = {}) {
   }
 
   async function backfill() {
-    const sessions = responseData(await client.session.list({
-      query: { directory },
-    })) || []
-    const roots = sessions
-      .filter((session) => !session.parentID)
-      .sort((left, right) => left.time.created - right.time.created)
-    for (const session of roots) {
-      await queueIngestion(session.id)
-      await new Promise((resolveYield) => setTimeout(resolveYield, 0))
+    if (backfillSessions === 0) {
+      return
+    }
+    const lease = await sidecar.request("acquire_backfill", {
+      owner: backfillOwner,
+      lease_seconds: BACKFILL_LEASE_SECONDS,
+    }, 30000)
+    if (!lease?.acquired) {
+      return
+    }
+    try {
+      const sessions = responseData(await client.session.list({
+        query: { directory },
+      })) || []
+      const roots = sessions
+        .filter((session) => !session.parentID)
+        .sort((left, right) => right.time.created - left.time.created)
+        .slice(0, backfillSessions)
+        .reverse()
+      for (const session of roots) {
+        await queueIngestion(session.id)
+        await sidecar.request("acquire_backfill", {
+          owner: backfillOwner,
+          lease_seconds: BACKFILL_LEASE_SECONDS,
+        }, 30000)
+        await new Promise((resolveYield) => setTimeout(resolveYield, 0))
+      }
+    } finally {
+      await sidecar.request("release_backfill", {
+        owner: backfillOwner,
+      }, 30000).catch(report)
     }
   }
 

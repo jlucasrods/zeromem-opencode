@@ -128,3 +128,33 @@ fn protocol_persists_deduplicates_excludes_and_deletes() {
     assert_eq!(stats["turns"], 1);
     restarted.shutdown();
 }
+
+#[test]
+fn backfill_lease_is_shared_between_processes_and_can_be_released() {
+    let directory = TempDir::new().unwrap();
+    let mut first = Sidecar::start(&directory);
+    let mut second = Sidecar::start(&directory);
+
+    let acquired = first.request(
+        "acquire_backfill",
+        json!({ "owner": "first", "lease_seconds": 60 }),
+    );
+    assert_eq!(acquired["acquired"], true);
+    let blocked = second.request(
+        "acquire_backfill",
+        json!({ "owner": "second", "lease_seconds": 60 }),
+    );
+    assert_eq!(blocked["acquired"], false);
+    let wrong_owner = second.request("release_backfill", json!({ "owner": "second" }));
+    assert_eq!(wrong_owner["released"], false);
+    let released = first.request("release_backfill", json!({ "owner": "first" }));
+    assert_eq!(released["released"], true);
+    let acquired = second.request(
+        "acquire_backfill",
+        json!({ "owner": "second", "lease_seconds": 60 }),
+    );
+    assert_eq!(acquired["acquired"], true);
+
+    first.shutdown();
+    second.shutdown();
+}

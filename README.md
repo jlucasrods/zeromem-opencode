@@ -59,11 +59,22 @@ rebuilding indexes for every query.
 When a root session becomes idle (`session.idle`), the plugin fetches its
 messages and sends only finalized canonical text to the sidecar.
 
-Ingestion is sent in batches of up to 64 turns. The sidecar generates their
+Ingestion is sent in batches of up to eight turns. The sidecar generates their
 embeddings in one model call, writes them in one SQLite transaction, and
 rebuilds the graph and temporal views once per batch. This avoids the large CPU
 spike caused by embedding and rebuilding the indexes separately for every
 historical message during backfill.
+
+Startup backfill is limited to the 20 most recent root sessions by default.
+Set `OPENCODE_ZEROMEM_BACKFILL_SESSIONS` before starting OpenCode to change the
+limit, or set it to `0` to disable startup backfill. New sessions are still
+ingested normally when they become idle.
+
+A lease stored atomically in the project SQLite database allows only one
+OpenCode process to run startup backfill at a time. Other terminals can still
+query memory and ingest their active sessions. The lease is released when
+backfill finishes and expires after 30 minutes if its owning process exits
+unexpectedly.
 
 The following data is stored:
 
@@ -216,13 +227,18 @@ the project.
 Production uses `bge-small-en-v1.5` through `fastembed`. The model runs locally,
 and no content is sent to external APIs.
 
-The current build uses the CPU execution provider. GPU execution is not
-required and is not enabled by default because it would require distributing
-and loading a compatible ONNX Runtime CUDA stack in addition to the NVIDIA
-driver. The batched CPU path is the portable default. For a temporary low-CPU
-test, the hash embedder can be selected with `OPENCODE_ZEROMEM_EMBEDDER=hash`,
-but its retrieval quality is intentionally not suitable as the production
-default.
+The current build uses the CPU execution provider. Embedding inputs are capped
+at 256 tokens, ingestion batches contain at most eight turns, and Linux
+sidecars are restricted to four available CPUs by default. The complete text
+is still stored in SQLite; only its embedding input is truncated. Set
+`OPENCODE_ZEROMEM_MAX_CPUS` before starting OpenCode to choose a different
+positive CPU limit.
+
+GPU execution is not required and is not enabled by default because it would
+require distributing and loading a compatible ONNX Runtime CUDA stack in
+addition to the NVIDIA driver. For a temporary low-CPU test, the hash embedder
+can be selected with `OPENCODE_ZEROMEM_EMBEDDER=hash`, but its retrieval quality
+is intentionally not suitable as the production default.
 
 If the model cannot be initialized, the sidecar fails. There is no silent hash
 embedding fallback in production. The hash embedder is available only for

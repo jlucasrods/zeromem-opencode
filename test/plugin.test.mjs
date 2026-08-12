@@ -84,6 +84,9 @@ test("idle ingests only canonical finalized text from root sessions", async () =
   const sidecar = {
     request: async (command, params) => {
       calls.push({ command, params })
+      if (command === "acquire_backfill") {
+        return { acquired: true }
+      }
       return { ingested: true }
     },
   }
@@ -199,6 +202,9 @@ test("backfill processes existing root sessions and skips children", async () =>
   const sidecar = {
     request: async (command, params) => {
       calls.push({ command, params })
+      if (command === "acquire_backfill") {
+        return { acquired: true }
+      }
       return { ingested: true }
     },
   }
@@ -212,10 +218,12 @@ test("backfill processes existing root sessions and skips children", async () =>
   setup.options.backfillDelay = 0
 
   await ZeroMemPlugin(setup.input, setup.options)
-  await waitFor(() => calls.length === 1)
+  await waitFor(() => calls.some((call) => call.command === "release_backfill"))
 
-  assert.equal(calls[0].command, "ingest_batch")
-  assert.equal(calls[0].params.turns[0].session_id, "root")
+  const ingestion = calls.find((call) => call.command === "ingest_batch")
+  assert.equal(ingestion.params.turns[0].session_id, "root")
+  assert.equal(calls[0].command, "acquire_backfill")
+  assert.equal(calls.at(-1).command, "release_backfill")
 })
 
 test("backfill keeps ingestion batches bounded", async () => {
@@ -223,20 +231,86 @@ test("backfill keeps ingestion batches bounded", async () => {
   const sidecar = {
     request: async (command, params) => {
       calls.push({ command, params })
+      if (command === "acquire_backfill") {
+        return { acquired: true }
+      }
       return { ingested: params.turns?.length || 0 }
     },
   }
   const sessions = [{ id: "root", time: { created: 1 } }]
   const messages = new Map([[
     "root",
-    Array.from({ length: 65 }, (_, index) => userMessage(`u${index}`, `memória ${index}`)),
+    Array.from({ length: 9 }, (_, index) => userMessage(`u${index}`, `memória ${index}`)),
   ]])
   const setup = fixture({ sidecar, sessions, messages })
   setup.options.disableBackfill = false
   setup.options.backfillDelay = 0
 
   await ZeroMemPlugin(setup.input, setup.options)
-  await waitFor(() => calls.length === 2)
+  await waitFor(() => calls.some((call) => call.command === "release_backfill"))
 
-  assert.deepEqual(calls.map((call) => call.params.turns.length), [64, 1])
+  assert.deepEqual(
+    calls.filter((call) => call.command === "ingest_batch").map((call) => call.params.turns.length),
+    [8, 1],
+  )
+})
+
+test("backfill is skipped without the database lease", async () => {
+  const calls = []
+  const sidecar = {
+    request: async (command, params) => {
+      calls.push({ command, params })
+      return { acquired: false }
+    },
+  }
+  const sessions = [{ id: "root", time: { created: 1 } }]
+  const setup = fixture({ sidecar, sessions })
+  setup.options.disableBackfill = false
+  setup.options.backfillDelay = 0
+
+  await ZeroMemPlugin(setup.input, setup.options)
+  await waitFor(() => calls.length === 1)
+
+  assert.equal(calls[0].command, "acquire_backfill")
+})
+
+test("backfill only processes the configured most recent root sessions", async () => {
+  const calls = []
+  const sidecar = {
+    request: async (command, params) => {
+      calls.push({ command, params })
+      if (command === "acquire_backfill") {
+        return { acquired: true }
+      }
+      return { ingested: params.turns?.length || 0 }
+    },
+  }
+  const sessions = Array.from({ length: 5 }, (_, index) => ({
+    id: `root-${index}`,
+    time: { created: index },
+  }))
+  const messages = new Map(sessions.map((session) => [
+    session.id,
+    [{
+      ...userMessage(`message-${session.id}`, `memory ${session.id}`),
+      info: {
+        ...userMessage(`message-${session.id}`, `memory ${session.id}`).info,
+        sessionID: session.id,
+      },
+    }],
+  ]))
+  const setup = fixture({ sidecar, sessions, messages })
+  setup.options.disableBackfill = false
+  setup.options.backfillDelay = 0
+  setup.options.backfillSessions = 2
+
+  await ZeroMemPlugin(setup.input, setup.options)
+  await waitFor(() => calls.some((call) => call.command === "release_backfill"))
+
+  assert.deepEqual(
+    calls
+      .filter((call) => call.command === "ingest_batch")
+      .map((call) => call.params.turns[0].session_id),
+    ["root-3", "root-4"],
+  )
 })

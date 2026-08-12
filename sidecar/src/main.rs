@@ -5,9 +5,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 type AnyError = Box<dyn std::error::Error + Send + Sync>;
 type Result<T> = std::result::Result<T, AnyError>;
+const DEFAULT_MAX_CPUS: usize = 4;
 
 #[derive(Deserialize)]
 struct Request {
@@ -45,6 +47,13 @@ struct DeleteSessionParams {
     session_id: String,
 }
 
+#[derive(Deserialize)]
+struct BackfillLeaseParams {
+    owner: String,
+    #[serde(default)]
+    lease_seconds: i64,
+}
+
 fn default_top_k() -> usize {
     5
 }
@@ -77,6 +86,28 @@ fn handle(memory: &mut MemoryStore, request: Request) -> (Response, bool) {
                 )?)?)
             }),
         "stats" => Ok(serde_json::to_value(memory.stats()).expect("stats serialize")),
+        "acquire_backfill" => serde_json::from_value::<BackfillLeaseParams>(request.params)
+            .map_err(Into::into)
+            .and_then(|params| {
+                if params.owner.is_empty() || params.lease_seconds <= 0 {
+                    return Err("owner and a positive lease_seconds are required".into());
+                }
+                let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+                Ok(json!({
+                    "acquired": memory.acquire_backfill(
+                        &params.owner,
+                        now,
+                        params.lease_seconds,
+                    )?
+                }))
+            }),
+        "release_backfill" => serde_json::from_value::<BackfillLeaseParams>(request.params)
+            .map_err(Into::into)
+            .and_then(|params| {
+                Ok(json!({
+                    "released": memory.release_backfill(&params.owner)?
+                }))
+            }),
         "delete_session" => serde_json::from_value::<DeleteSessionParams>(request.params)
             .map_err(Into::into)
             .and_then(|params| {
@@ -132,6 +163,33 @@ fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn limit_cpu_affinity(max_cpus: usize) -> Result<()> {
+    let mut available = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+    let size = std::mem::size_of::<libc::cpu_set_t>();
+    if unsafe { libc::sched_getaffinity(0, size, &mut available) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+
+    let mut limited = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+    let mut selected = 0;
+    for cpu in 0..libc::CPU_SETSIZE as usize {
+        if unsafe { libc::CPU_ISSET(cpu, &available) } && selected < max_cpus {
+            unsafe { libc::CPU_SET(cpu, &mut limited) };
+            selected += 1;
+        }
+    }
+    if selected == 0 || unsafe { libc::sched_setaffinity(0, size, &limited) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn limit_cpu_affinity(_max_cpus: usize) -> Result<()> {
+    Ok(())
+}
+
 fn run() -> Result<()> {
     #[cfg(unix)]
     unsafe {
@@ -145,6 +203,12 @@ fn run() -> Result<()> {
     }
     std::fs::create_dir_all(&cache_path)?;
     set_mode(&cache_path, 0o700)?;
+    let max_cpus = std::env::var("OPENCODE_ZEROMEM_MAX_CPUS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_CPUS);
+    limit_cpu_affinity(max_cpus)?;
     let embedder: Box<dyn Embedder> =
         if std::env::var("OPENCODE_ZEROMEM_EMBEDDER").as_deref() == Ok("hash") {
             Box::new(HashEmbedder)

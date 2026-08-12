@@ -1,13 +1,16 @@
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use regex::Regex;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 const WINDOW_SIZE: usize = 4;
 const EPISODE_GAP_SECONDS: i64 = 6 * 60 * 60;
+const EMBEDDING_MAX_TOKENS: usize = 256;
+const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -32,8 +35,9 @@ pub struct FastEmbedder {
 
 impl FastEmbedder {
     pub fn open(cache_dir: &Path) -> Result<Self> {
-        let options =
-            InitOptions::new(EmbeddingModel::BGESmallENV15).with_cache_dir(cache_dir.to_path_buf());
+        let options = InitOptions::new(EmbeddingModel::BGESmallENV15)
+            .with_cache_dir(cache_dir.to_path_buf())
+            .with_max_length(EMBEDDING_MAX_TOKENS);
         let model =
             TextEmbedding::try_new(options).map_err(|error| Error::Embedding(error.to_string()))?;
         Ok(Self {
@@ -153,8 +157,8 @@ pub struct MemoryStore {
 impl MemoryStore {
     pub fn open(path: &Path, embedder: Box<dyn Embedder>) -> Result<Self> {
         let connection = Connection::open(path)?;
-        connection.execute_batch(
-            "PRAGMA journal_mode = WAL;
+        connection.busy_timeout(DATABASE_BUSY_TIMEOUT)?;
+        let schema = "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              CREATE TABLE IF NOT EXISTS turns (
                 id INTEGER PRIMARY KEY,
@@ -169,8 +173,27 @@ impl MemoryStore {
              CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
-             );",
-        )?;
+             );
+             CREATE TABLE IF NOT EXISTS leases (
+                name TEXT PRIMARY KEY,
+                owner TEXT NOT NULL,
+                expires_at INTEGER NOT NULL
+             );";
+        let deadline = Instant::now() + DATABASE_BUSY_TIMEOUT;
+        loop {
+            match connection.execute_batch(schema) {
+                Ok(()) => break,
+                Err(error)
+                    if matches!(
+                        error.sqlite_error_code(),
+                        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+                    ) && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
 
         let previous_embedder: Option<String> = connection
             .query_row("SELECT value FROM meta WHERE key = 'embedder'", [], |row| {
@@ -201,6 +224,26 @@ impl MemoryStore {
     pub fn ingest(&mut self, turn: &IngestTurn) -> Result<(bool, i64)> {
         let mut results = self.ingest_batch(std::slice::from_ref(turn))?;
         Ok(results.remove(0))
+    }
+
+    pub fn acquire_backfill(&mut self, owner: &str, now: i64, lease_seconds: i64) -> Result<bool> {
+        let changed = self.connection.execute(
+            "INSERT INTO leases(name, owner, expires_at)
+             VALUES ('backfill', ?1, ?2)
+             ON CONFLICT(name) DO UPDATE SET
+                owner = excluded.owner,
+                expires_at = excluded.expires_at
+             WHERE leases.expires_at <= ?3 OR leases.owner = excluded.owner",
+            params![owner, now + lease_seconds, now],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn release_backfill(&mut self, owner: &str) -> Result<bool> {
+        Ok(self.connection.execute(
+            "DELETE FROM leases WHERE name = 'backfill' AND owner = ?1",
+            [owner],
+        )? == 1)
     }
 
     pub fn ingest_batch(&mut self, turns: &[IngestTurn]) -> Result<Vec<(bool, i64)>> {
